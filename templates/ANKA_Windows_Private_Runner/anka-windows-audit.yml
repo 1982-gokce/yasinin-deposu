@@ -1,0 +1,58 @@
+# TEMPLATE ONLY: Move this file into .github/workflows/ of a PRIVATE repo.
+name: ANKA Windows Ag Kontrolu
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "requests/network-check-*.txt"
+permissions:
+  contents: read
+jobs:
+  network_audit:
+    if: ${{ github.event.repository.private == true }}
+    runs-on: [self-hosted, Windows, X64, anka-windows]
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ag tanilama ve rapor yazma
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $results = New-Object System.Collections.Generic.List[string]
+          $results.Add("ANKA Windows network audit - $(Get-Date -Format o)")
+          $results.Add("Computer: $env:COMPUTERNAME")
+          $net = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 5 Name,InterfaceDescription
+          $results.Add("Active adapters: " + (($net | ForEach-Object Name) -join ', '))
+          $config = Get-NetIPConfiguration | Where-Object IPv4DefaultGateway | Select-Object -First 1
+          if ($config) {
+            $results.Add("Interface: " + $config.InterfaceAlias)
+            $results.Add("IPv4 gateway: " + (($config.IPv4DefaultGateway | ForEach-Object NextHop) -join ', '))
+            $results.Add("DNS servers: " + (($config.DNSServer.ServerAddresses) -join ', '))
+          }
+          $proxy = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+          $results.Add("User proxy enabled: " + [bool]($proxy.ProxyEnable -eq 1))
+          $ipok = $false
+          try { $ipok = [bool](Test-NetConnection -ComputerName 1.1.1.1 -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue) } catch {}
+          $results.Add("Internet TCP 1.1.1.1:443: $ipok")
+          $dnsok = $false
+          try { $dnsok = @((Resolve-DnsName www.microsoft.com -Type A -ErrorAction Stop) | Where-Object IPAddress).Count -gt 0 } catch {}
+          $results.Add("Microsoft.com DNS: $dnsok")
+          $httpsok = $false
+          try { $web = Invoke-WebRequest -Uri 'https://www.microsoft.com' -UseBasicParsing -TimeoutSec 15; $httpsok = ($web.StatusCode -ge 200 -and $web.StatusCode -lt 400) } catch {}
+          $results.Add("Microsoft.com HTTPS: $httpsok")
+          New-Item -ItemType Directory -Force -Path reports | Out-Null
+          $results | Set-Content -LiteralPath reports/latest-network-status.txt -Encoding UTF8
+          Get-Content reports/latest-network-status.txt
+      - name: Raporu ozel depoya kaydet
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/latest-network-status.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "docs: update Windows network audit"
+            git push origin "HEAD:$env:GITHUB_REF_NAME"
+          }
