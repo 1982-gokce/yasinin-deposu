@@ -1,0 +1,94 @@
+name: Secure temporary Windows build
+on:
+  push:
+    branches: [anka-windows-secure-2f89a30c1ff2]
+    paths: ['.github/workflows/anka-secure-windows.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Publish ephemeral encryption key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rsa = [System.Security.Cryptography.RSA]::Create(3072)
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'anka-runner-private.pem'), $rsa.ExportPkcs8PrivateKeyPem())
+          [IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE 'anka-runner-public.pem'), $rsa.ExportSubjectPublicKeyInfoPem())
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add anka-runner-public.pem
+          git commit -m 'Publish temporary build encryption key'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not commit public key' }
+          git push origin ('HEAD:refs/heads/' + $env:GITHUB_REF_NAME)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish public key' }
+      - name: Decrypt and run build
+        id: privatebuild
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $found = $false
+          for ($i=0; $i -lt 180; $i++) {
+            git fetch -q origin ('+refs/heads/' + $env:GITHUB_REF_NAME + ':refs/remotes/origin/' + $env:GITHUB_REF_NAME)
+            $json = git show ('refs/remotes/origin/' + $env:GITHUB_REF_NAME + ':anka-payload.json') 2>$null
+            if ($LASTEXITCODE -eq 0) { $found = $true; break }
+            Start-Sleep -Seconds 5
+          }
+          if (!$found) { throw 'Encrypted payload was not received' }
+          $envelope = $json | ConvertFrom-Json
+          $rsa = [System.Security.Cryptography.RSA]::Create()
+          $rsa.ImportFromPem([IO.File]::ReadAllText((Join-Path $env:RUNNER_TEMP 'anka-runner-private.pem')))
+          $key = $rsa.Decrypt([Convert]::FromBase64String($envelope.key), [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $cipher = [Convert]::FromBase64String($envelope.cipher)
+          $plain = [byte[]]::new($cipher.Length)
+          $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+          $aes.Decrypt([Convert]::FromBase64String($envelope.nonce), $cipher, [Convert]::FromBase64String($envelope.tag), $plain)
+          $private = Join-Path $env:RUNNER_TEMP 'anka-private'
+          New-Item -ItemType Directory -Force -Path $private | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $private 'input.zip'), $plain)
+          Expand-Archive -Path (Join-Path $private 'input.zip') -DestinationPath (Join-Path $private 'src')
+          & (Join-Path $private 'src/windows_build_verify.ps1')
+          if ($LASTEXITCODE -ne 0) { throw 'Build or verification did not pass' }
+      - name: Encrypt build output
+        if: always()
+        shell: pwsh
+        env:
+          RESULT_PUBLIC_B64: MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAtqRvnD9MHv0Egfz2mTM0MWh+VWlFTKnOMOx2WmiWg9TKI+QfXwifQ90Jf/OBUG4NNtcPvW+iLg5A9KjynSqqXRouGypTtmpQXA/DBuMjELcQSq4bLxQORmjzB0jZ0jdrTd+bdAv41VGwi7cxbCQBL/p2vhs611YCDfHDaJqt3IG2qRnbeBYl+KC7QfJ7BUHoEYVYBkiTfD+OUhcO+VJrFDYD+owegmBwYVTa4ThwvwOSDIabR4zW7nxEb8UUWZfHP6DwOZOI0XXp4At2hxG1mRd2OSkVz1VA05FB3+bqWkS3mRAXqwFaW/WK87/TDDnxYycTk4BUr29gWRqEviSPukcCsE0hYTbJ7xeNvrT+7etoYSluD3Vgef/fs2QkVFcryDqqQZseA+h7UDiptkc1z5/QMsRRVqKfTNpuMFi6p5b3kTipxCrkMUg69sSVRM6wXL3bu/ZsLT+MlGO23xTpnPMGJ9p6YQmpxvUZ2uU43q0xzMHVEyyI/PXswyM0JfCvAgMBAAE=
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'anka-result'
+          if (!(Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null; 'FAIL: no output' | Set-Content (Join-Path $out 'outcome.txt') }
+          $zip = Join-Path $env:RUNNER_TEMP 'anka-result.zip'
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -CompressionLevel Fastest
+          $plain = [IO.File]::ReadAllBytes($zip)
+          $key = [byte[]]::new(32); [Security.Cryptography.RandomNumberGenerator]::Fill($key)
+          $nonce = [byte[]]::new(12); [Security.Cryptography.RandomNumberGenerator]::Fill($nonce)
+          $cipher = [byte[]]::new($plain.Length); $tag = [byte[]]::new(16)
+          $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+          $aes.Encrypt($nonce, $plain, $cipher, $tag)
+          $rsa = [Security.Cryptography.RSA]::Create(); $read = 0
+          $rsa.ImportSubjectPublicKeyInfo([Convert]::FromBase64String($env:RESULT_PUBLIC_B64), [ref]$read)
+          $encryptedKey = $rsa.Encrypt($key, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $result = Join-Path $env:RUNNER_TEMP 'anka-encrypted-result'
+          New-Item -ItemType Directory -Path $result -Force | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $result 'cipher.bin'), $cipher)
+          @{ key=[Convert]::ToBase64String($encryptedKey); nonce=[Convert]::ToBase64String($nonce); tag=[Convert]::ToBase64String($tag) } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 (Join-Path $result 'metadata.json')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: encrypted-windows-result
+          path: ${{ runner.temp }}/anka-encrypted-result/
+          retention-days: 1
+          compression-level: 0
+      - name: Check outcome
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.privatebuild.outcome }}' -ne 'success') { throw 'Windows build or verification did not succeed' }
