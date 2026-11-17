@@ -1,0 +1,78 @@
+name: ANKA dependency lock verification
+on:
+  push:
+    branches: [anka-windows-dependencies-796df1a2b8e4]
+    paths: ['.github/workflows/anka-dependency-lock.yml']
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Resolve Windows wheels and verify hash enforcement
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wheels=Join-Path $env:RUNNER_TEMP 'ankawheels'
+          $out=Join-Path $env:RUNNER_TEMP 'ankalock'
+          New-Item -Type Directory -Path $wheels,$out -Force | Out-Null
+          py -3.11 -m pip download --only-binary=:all: --dest $wheels 'PySide6==6.12.0' 'requests==2.34.2' 'urllib3==2.8.0' 'pyinstaller==6.22.3' 'bandit==1.9.4' 'pip-audit==2.10.1' 'pip==26.3'
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel resolution failed' }
+          $script = @'
+          import email.parser, hashlib, json, os, pathlib, re, shutil, subprocess, sys, zipfile
+          wheels=pathlib.Path(os.environ['RUNNER_TEMP'])/'ankawheels'
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'ankalock'
+          records={}
+          for wheel in sorted(wheels.glob('*.whl')):
+              with zipfile.ZipFile(wheel) as z:
+                  metas=[x for x in z.namelist() if x.endswith('.dist-info/METADATA') and x.count('/')==1]
+                  if len(metas)!=1: raise ValueError('Invalid wheel metadata')
+                  data=email.parser.BytesParser().parsebytes(z.read(metas[0]))
+                  name,version=data['Name'],data['Version']
+              if not name or not version or not re.fullmatch(r'[A-Za-z0-9_.-]+',name) or not re.fullmatch(r'[A-Za-z0-9_.+!-]+',version): raise ValueError('Invalid name/version')
+              normalized=re.sub('[-_.]+','-',name).lower()
+              if normalized in records: raise ValueError('Duplicate package')
+              records[normalized]={'name':name,'version':version,'filename':wheel.name,'sha256':hashlib.sha256(wheel.read_bytes()).hexdigest()}
+          if not {'pyside6','requests','urllib3','pyinstaller','bandit','pip-audit','pip'}<=records.keys(): raise ValueError('Missing required wheel')
+          lines=['# Windows x64, CPython 3.11; wheel hashes, generated on Windows.', '# All packages are pinned; source distributions are not permitted.']
+          for key,record in sorted(records.items()): lines.append(f"{record['name']}=={record['version']} --hash=sha256:{record['sha256']}")
+          (out/'requirements-windows.lock').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          (out/'wheel-manifest.json').write_text(json.dumps(records,sort_keys=True,indent=2),encoding='utf-8')
+          print('Locked packages:',len(records))
+          '@
+          $script | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'create_lock.py')
+          py -3.11 (Join-Path $env:RUNNER_TEMP 'create_lock.py')
+          if ($LASTEXITCODE -ne 0) { throw 'Lock generation failed' }
+          $venv=Join-Path $env:RUNNER_TEMP 'ankalock-venv'
+          py -3.11 -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed' }
+          $python=Join-Path $venv 'Scripts\python.exe'
+          & $python -m pip install --no-index --find-links $wheels --only-binary=:all: --require-hashes -r (Join-Path $out 'requirements-windows.lock') *> (Join-Path $out 'hash-install.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'Hash-locked installation failed' }
+          & $python -m pip check *> (Join-Path $out 'pip-check.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'Installed dependencies are inconsistent' }
+          & $python -c 'import PySide6,requests,urllib3,PyInstaller,bandit,pip_audit,platform;print(platform.platform());print(PySide6.__version__,requests.__version__,urllib3.__version__,PyInstaller.__version__)' *> (Join-Path $out 'import-check.txt')
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned dependencies failed to import' }
+          $record=Get-Content -Raw (Join-Path $out 'wheel-manifest.json') | ConvertFrom-Json
+          $item=$record.'altgraph'
+          if (!$item) { throw 'Expected negative-test package missing' }
+          $bad=Join-Path $env:RUNNER_TEMP 'ankabad'; New-Item -Type Directory $bad -Force | Out-Null
+          $badfile=Join-Path $bad $item.filename; Copy-Item (Join-Path $wheels $item.filename) $badfile
+          $file=[IO.File]::OpenWrite($badfile);$file.Position=$file.Length;$file.WriteByte(1);$file.Close()
+          ($item.name+'=='+$item.version+' --hash=sha256:'+$item.sha256) | Set-Content -Encoding utf8 (Join-Path $bad 'bad.lock')
+          $ErrorActionPreference='Continue'
+          & $python -m pip download --no-index --no-cache-dir --no-deps --only-binary=:all: --require-hashes --find-links $bad --dest (Join-Path $bad 'out') -r (Join-Path $bad 'bad.lock') *> (Join-Path $out 'tampered-wheel-test.txt')
+          $badExit=$LASTEXITCODE; $ErrorActionPreference='Stop'
+          if ($badExit -eq 0 -or !((Get-Content -Raw (Join-Path $out 'tampered-wheel-test.txt')) -match 'THESE PACKAGES DO NOT MATCH THE HASHES')) { throw 'Tampered wheel was not rejected by hash verification' }
+          'PASS: hash-locked install and tampered wheel rejection' | Set-Content -Encoding utf8 (Join-Path $out 'outcome.txt')
+          $global:LASTEXITCODE=0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: verified-windows-dependency-lock
+          path: ${{ runner.temp }}/ankalock/
+          retention-days: 30
