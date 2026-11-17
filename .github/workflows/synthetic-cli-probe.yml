@@ -1,0 +1,46 @@
+name: Synthetic Windows CLI quoting probe
+on:
+  push:
+    branches: [anka-windows-cli-probe-b97a45d0e3]
+    paths: ['.github/workflows/synthetic-cli-probe.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Exercise harmless command wrappers
+        shell: python
+        run: |
+          import json, os, pathlib, subprocess, sys, tempfile
+          env = dict(os.environ); env["CLI_PROBE_DUMMY"] = "EXPANDED"
+          with tempfile.TemporaryDirectory() as directory:
+              root = pathlib.Path(directory)
+              target = root / "target.py"
+              capture = root / "capture.json"
+              marker = root / "unexpected-marker.txt"
+              target.write_text("import json,sys,pathlib\npathlib.Path(" + repr(str(capture)) + ").write_text(json.dumps({'args':sys.argv[1:],'stdin':sys.stdin.read()}),encoding='utf-8')\n", encoding="utf-8")
+              wrapper = root / "fixture.cmd"
+              wrapper.write_text('@echo off\r\n"' + sys.executable + '" "' + str(target) + '" %*\r\n', encoding="utf-8")
+              tasks = [
+                  ("benign", "Review a finance report"),
+                  ("percent", "Review %CLI_PROBE_DUMMY% literally"),
+                  ("ampersand", "A & B"),
+                  ("quote_escape", 'X" & echo INJECTED > "' + str(marker) + '" & rem "'),
+              ]
+              for name, task in tasks:
+                  if capture.exists(): capture.unlink()
+                  if marker.exists(): marker.unlink()
+                  proc = subprocess.run([str(wrapper), "--mode=plan", "--print", task], input="", capture_output=True, text=True, shell=False, env=env, timeout=20)
+                  observed = json.loads(capture.read_text(encoding="utf-8")) if capture.exists() else None
+                  print(json.dumps({"name":name, "exit":proc.returncode, "argument_preserved":bool(observed and observed["args"][-1] == task), "marker_created":marker.exists()}, sort_keys=True))
+              if capture.exists(): capture.unlink()
+              stdin_task = 'X" & echo INJECTED > "' + str(marker) + '" & rem " %CLI_PROBE_DUMMY%'
+              workspace = str(root / "work%CLI_PROBE_DUMMY%space")
+              proc = subprocess.run([str(wrapper), "exec", "--cd", workspace, "-"], input=stdin_task, capture_output=True, text=True, shell=False, env=env, timeout=20)
+              observed = json.loads(capture.read_text(encoding="utf-8")) if capture.exists() else None
+              print(json.dumps({"name":"stdin_with_workspace", "exit":proc.returncode, "stdin_preserved":bool(observed and observed["stdin"] == stdin_task), "workspace_preserved":bool(observed and observed["args"][2] == workspace), "marker_created":marker.exists()}, sort_keys=True))
