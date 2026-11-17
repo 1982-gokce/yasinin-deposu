@@ -1,0 +1,57 @@
+name: Preserve encrypted Windows build evidence
+on:
+  push:
+    branches: [anka-preserve-22c7f41ca839]
+    paths: ['.github/workflows/anka-preserve.yml']
+permissions:
+  actions: read
+  contents: read
+jobs:
+  preserve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download encrypted result from verified run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: 14250437163
+          run-id: 43917173971
+          repository: 1982-gokce/yasinin-deposu
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/encrypted
+      - name: Download run-specific public key
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: 14252285138
+          run-id: 43917173971
+          repository: 1982-gokce/yasinin-deposu
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/runner-key
+      - name: Verify encrypted evidence contents
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          expected={'encrypted/cipher.bin':'a72d638dcdb5bdfbe169b0e412cb718e23d288016b35805cdcb8fb38ea5f94c8','encrypted/metadata.json':'6081595e2aaad738de3d779090cfa1917e046ba2b3332dbdb10f9de5e35cb0ac','runner-key/anka-runner-public.pem':'5593df9ecf8aca7cdbb06c2de939d848dd7dc270f5ee2298910a6b0e69388edc'}
+          for name, digest in expected.items():
+              h=hashlib.sha256()
+              with (root/name).open('rb') as f:
+                  while chunk:=f.read(1048576): h.update(chunk)
+              if h.hexdigest()!=digest: raise RuntimeError('Evidence digest mismatch: '+name)
+          print('All encrypted evidence hashes verified')
+          PY
+      - name: Preserve encrypted result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: anka-encrypted-evidence-43917173971
+          path: ${{ runner.temp }}/encrypted/
+          retention-days: 30
+          compression-level: 0
+      - name: Preserve runner public key
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: anka-runner-key-43917173971
+          path: ${{ runner.temp }}/runner-key/
+          retention-days: 30
