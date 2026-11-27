@@ -1,0 +1,123 @@
+name: Secure temporary Windows build
+on:
+  push:
+    branches: [anka-windows-secure-664f7edd13f5]
+    paths: ['.github/workflows/anka-secure-windows.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Publish ephemeral encryption key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rsa = [System.Security.Cryptography.RSA]::Create(3072)
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'anka-runner-private.pem'), $rsa.ExportPkcs8PrivateKeyPem())
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'anka-runner-public.pem'), $rsa.ExportSubjectPublicKeyInfoPem())
+      - name: Upload runner key for this run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: anka-runner-public
+          path: ${{ runner.temp }}/anka-runner-public.pem
+          retention-days: 30
+      - name: Decrypt and run build
+        id: privatebuild
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $found = $false
+          for ($i=0; $i -lt 180; $i++) {
+            git fetch -q origin ('+refs/heads/' + $env:GITHUB_REF_NAME + ':refs/remotes/origin/' + $env:GITHUB_REF_NAME)
+            $json = git show ('refs/remotes/origin/' + $env:GITHUB_REF_NAME + ':anka-payload.json') 2>$null
+            if ($LASTEXITCODE -eq 0) { $found = $true; break }
+            Start-Sleep -Seconds 5
+          }
+          if (!$found) { throw 'Encrypted payload was not received' }
+          if ($json.Length -gt 10000000) { throw 'Encrypted payload exceeds size limit' }
+          $envelope = $json | ConvertFrom-Json
+          $runnerKeyHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'anka-runner-public.pem')))).ToLowerInvariant()
+          if ($envelope.run_id -ne $env:GITHUB_RUN_ID -or $envelope.run_attempt -ne $env:GITHUB_RUN_ATTEMPT -or $envelope.workflow_sha -ne $env:GITHUB_SHA -or $envelope.runner_key_sha256 -ne $runnerKeyHash) { throw 'Payload is not bound to this Windows run and runner key' }
+          $rsa = [System.Security.Cryptography.RSA]::Create()
+          $rsa.ImportFromPem([IO.File]::ReadAllText((Join-Path $env:RUNNER_TEMP 'anka-runner-private.pem')))
+          $key = $rsa.Decrypt([Convert]::FromBase64String($envelope.key), [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $cipher = [Convert]::FromBase64String($envelope.cipher)
+          $plain = [byte[]]::new($cipher.Length)
+          $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+          $aes.Decrypt([Convert]::FromBase64String($envelope.nonce), $cipher, [Convert]::FromBase64String($envelope.tag), $plain)
+          function Assert-PinnedSource([byte[]] $data, [string] $expected) {
+            $actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($data)).ToLowerInvariant()
+            if ($actual -ne $expected) { throw [Security.Cryptography.CryptographicException]::new('Source archive hash mismatch') }
+            return $actual
+          }
+          $probe=[byte[]](1,2,3); $probeHash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($probe)).ToLowerInvariant()
+          $null=Assert-PinnedSource $probe $probeHash; $probe[0]=0; $rejected=$false
+          try { $null=Assert-PinnedSource $probe $probeHash } catch [Security.Cryptography.CryptographicException] { $rejected=$true }
+          if (!$rejected) { throw 'Tampered source check failed' }
+          $out=Join-Path $env:RUNNER_TEMP 'anka-result'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          try { $sourceHash=Assert-PinnedSource $plain '676b7d9c5c543ef620389e33bad6ace81be8546a5c62847e44d56150423c9b14' } catch [Security.Cryptography.CryptographicException] {
+            'FAIL: source archive hash mismatch' | Set-Content -Encoding utf8 (Join-Path $out 'outcome.txt')
+            throw 'Source archive hash mismatch'
+          }
+          @{source_commit='4f4992242aa24461b222e0ad895d7cdca81776ee'; source_tree='8aee89ba9e16690b9a3df2191d72c15e0782dc5d'; archive_sha256=$sourceHash; workflow_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; modified_source_rejected=$rejected} | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $out 'source-verification.json')
+          $private = Join-Path $env:RUNNER_TEMP 'anka-private'
+          New-Item -ItemType Directory -Force -Path $private | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $private 'input.zip'), $plain)
+          Expand-Archive -Path (Join-Path $private 'input.zip') -DestinationPath (Join-Path $private 'src')
+          & (Join-Path $private 'src/windows_build_verify.ps1')
+          if ($LASTEXITCODE -ne 0) { throw 'Build or verification did not pass' }
+      - name: Encrypt build output
+        if: always()
+        shell: pwsh
+        env:
+          RESULT_PUBLIC_B64: MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAnzUVmqjvCCfUmzl8R3wG3qbdttWjXoyVpg71VcOKnA9+0vkLa294SBfbr7Tm8xzaSouc8h7M8i2leVaQGCiFxFXxZ55O6bMt2eVGMI0IZ3wir7lEoG/HUPRJUuODmLYClguSe9bAy8kojrf6vWBQyupUvLK+rB3RsODodtZ6rQIfaRNROgH2L6rKbtCBaNoPeurThcmNWFWAzEpF+jGkqCt2esl5t661tQBR9ca+mxDfhmFPSrfAO/Rg0yKkIB2bV1xV/PHzLJ+zCTTVxCQhyyj5/h6m9NVIkvVfmLh2WtMzqbmpgDcKP++ylfTT3mbYIE03dhCNTu8iAQyYW44RNa1RfLEaQCot+Y6fq/6KQFNse9TzvNgAidX7f60DKMFKj/xx3O3NL95JYjG7BGVNz9exOuWgVwzwEFhm/veoCVHI2/JXU1+bkSTVCfAadBV0kkd+E1G/3mwJFafBgtYgWfLGflz7b1BGYPiwjocf3tkoY9MB6RqYyqV5sAg+2XEnAgMBAAE=
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'anka-result'
+          if (!(Test-Path $out)) { New-Item -ItemType Directory -Force -Path $out | Out-Null; 'FAIL: no output' | Set-Content (Join-Path $out 'outcome.txt') }
+          $verifiedSource=$null
+          $sourceRecord=Join-Path $out 'source-verification.json'
+          if (Test-Path $sourceRecord) { $verifiedSource=Get-Content -Raw $sourceRecord | ConvertFrom-Json }
+          $binaries=@{}
+          foreach ($name in @('ANKA_Finans_Professional_V1.exe','ANKA_Finans_Professional_V1_Setup.exe')) {
+            $item=Join-Path $out $name
+            if (Test-Path $item) { $binaries[$name]=(Get-FileHash -Algorithm SHA256 $item).Hash.ToLowerInvariant() }
+          }
+          @{run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; workflow_sha=$env:GITHUB_SHA; source=$verifiedSource; binaries=$binaries} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $out 'result-manifest.json')
+          $zip = Join-Path $env:RUNNER_TEMP 'anka-result.zip'
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -CompressionLevel Fastest
+          $plain = [IO.File]::ReadAllBytes($zip)
+          $key = [byte[]]::new(32); [Security.Cryptography.RandomNumberGenerator]::Fill($key)
+          $nonce = [byte[]]::new(12); [Security.Cryptography.RandomNumberGenerator]::Fill($nonce)
+          $cipher = [byte[]]::new($plain.Length); $tag = [byte[]]::new(16)
+          $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+          $aes.Encrypt($nonce, $plain, $cipher, $tag)
+          $rsa = [Security.Cryptography.RSA]::Create(); $read = 0
+          $rsa.ImportSubjectPublicKeyInfo([Convert]::FromBase64String($env:RESULT_PUBLIC_B64), [ref]$read)
+          $encryptedKey = $rsa.Encrypt($key, [Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $result = Join-Path $env:RUNNER_TEMP 'anka-encrypted-result'
+          New-Item -ItemType Directory -Path $result -Force | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $result 'cipher.bin'), $cipher)
+          @{ key=[Convert]::ToBase64String($encryptedKey); nonce=[Convert]::ToBase64String($nonce); tag=[Convert]::ToBase64String($tag) } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 (Join-Path $result 'metadata.json')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: encrypted-windows-result
+          path: ${{ runner.temp }}/anka-encrypted-result/
+          retention-days: 30
+          compression-level: 0
+      - name: Check outcome
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.privatebuild.outcome }}' -ne 'success') { throw 'Windows build or verification did not succeed' }
